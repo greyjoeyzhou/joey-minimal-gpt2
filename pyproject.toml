@@ -1,0 +1,35 @@
+[project]
+name = "minimal-gpt2"
+version = "0.0.1"
+description = "Minimal GPT-2 124M training project for learning."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.5",
+    "tiktoken>=0.7",
+    "datasets>=2.20",
+    "numpy>=1.26",
+    "requests>=2.31",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# E,F = pyflakes/pycodestyle (defaults), I = isort, UP = pyupgrade, B = bugbear
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    "E501",  # line too long; we have long comment blocks intentionally
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
