@@ -150,7 +150,7 @@ def main() -> None:
     # --- Resume? ---
     start_step = 0
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"] + 1
@@ -216,6 +216,20 @@ def main() -> None:
                 f"step {step:6d} | loss {loss_accum:.4f} | lr {lr:.2e} | "
                 f"dt {dt*1000:6.1f}ms | tok/s {tokens_per_sec:,.0f}"
             )
+
+    # Save final checkpoint (in case max_steps is not a multiple of save_interval).
+    final_step = cfg.max_steps - 1
+    ckpt_path = cfg.ckpt_dir / f"model_{final_step:06d}.pt"
+    torch.save(
+        {
+            "step": final_step,
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config": cfg,
+        },
+        ckpt_path,
+    )
+    print(f"step {final_step:6d} | saved {ckpt_path}")
 
     logger.close()
     print("Training complete.")
