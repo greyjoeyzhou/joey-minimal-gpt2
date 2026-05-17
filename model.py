@@ -213,6 +213,10 @@ class GPT(nn.Module):
         Returns:
             logits: (B, T, vocab_size).
             loss: scalar cross-entropy if targets provided, else None.
+
+        NOTE:
+            B -> Batch size
+            T -> Sequence size (number of tokens)
         """
         B, T = idx.size()
         assert T <= self.config.block_size, (
