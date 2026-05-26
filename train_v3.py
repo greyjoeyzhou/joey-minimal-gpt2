@@ -22,10 +22,16 @@ from __future__ import annotations
 
 import argparse
 import time
+import warnings
 from dataclasses import fields
 from pathlib import Path
 
 import torch
+
+# Inductor splits the router softmax reduction across thread blocks for large
+# batch sizes, which disables the online-softmax fusion. The op is correct and
+# the softmax is over n_routed=4 values — negligible cost either way.
+warnings.filterwarnings("ignore", message="Online softmax is disabled")
 
 from config_v3 import GPTConfig, TrainConfig
 from data import DataLoaderLite

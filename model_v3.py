@@ -182,33 +182,67 @@ class MoELayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, T, C = x.shape
+        N = B * T
+        flat_x = x.view(N, C)
 
-        # Shared expert output — computed for every token.
+        # Shared expert — always fires on the full batch.
         shared_out = sum(e(x) for e in self.shared_experts)
 
         # Router: softmax scores + top-k selection.
-        scores = F.softmax(self.router(x), dim=-1)           # (B, T, n_routed)
+        scores = F.softmax(self.router(flat_x), dim=-1)       # (N, n_routed)
         topk_scores, topk_idx = scores.topk(self.top_k, dim=-1)
-        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
+        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)
 
-        # Dispatch tokens to their selected experts.
-        # Each expert runs on its subset of tokens (no wasted compute).
-        flat_x      = x.view(B * T, C)
-        flat_idx    = topk_idx.view(B * T, self.top_k)
-        flat_scores = topk_scores.view(B * T, self.top_k)
+        # --- Sort-then-dispatch (replaces the old nested loop) ---
+        #
+        # Old approach: loop over (n_routed × top_k) = 8 iterations, each
+        # launching a small kernel on ~N/5 scattered tokens.
+        #
+        # New approach:
+        #   1. Flatten all N*k (token, expert) assignment pairs.
+        #   2. Sort by expert ID → each expert's tokens become a contiguous slice.
+        #   3. One kernel per expert on its slice → n_routed=4 kernel launches.
+        #   4. Weight outputs and scatter-add back to original token positions.
+        #
+        # Why contiguous slices matter:
+        #   - One larger matmul per expert (better tensor-core utilisation).
+        #   - Sequential memory reads inside each chunk (coalesced access).
+        #   - Average chunk size ~N*k/n_routed ≈ 2× larger than before.
 
-        routed_out = torch.zeros(B * T, C, device=x.device, dtype=x.dtype)
-        for e_id, expert in enumerate(self.routed_experts):
-            for k in range(self.top_k):
-                mask = (flat_idx[:, k] == e_id)
-                if not mask.any():
-                    continue
-                w   = flat_scores[mask, k].unsqueeze(-1)
-                routed_out[mask] += w * expert(flat_x[mask])
+        # Step 1: flatten the N*k (token, expert) pairs.
+        token_ids  = torch.arange(N, device=x.device).unsqueeze(1).expand(N, self.top_k).reshape(-1)  # (N*k,)
+        expert_ids = topk_idx.reshape(-1)   # (N*k,)
+        weights    = topk_scores.reshape(-1)  # (N*k,)
 
-        routed_out = routed_out.view(B, T, C)
+        # Step 2: sort all pairs by expert ID.
+        sort_order     = expert_ids.argsort()
+        sorted_tokens  = token_ids[sort_order]   # (N*k,) — original token index
+        sorted_weights = weights[sort_order]     # (N*k,)
+        sorted_x       = flat_x[sorted_tokens]  # (N*k, C) — gathered inputs
+
+        # One CPU-GPU sync to get per-expert token counts as Python ints.
+        # This is unavoidable in pure PyTorch; a CUDA extension (e.g. Megablocks)
+        # eliminates it by keeping counts on-device.
+        counts = expert_ids[sort_order].bincount(minlength=self.n_routed).tolist()
+
+        # Step 3: one kernel per expert on its contiguous chunk.
+        routed_out = torch.empty_like(sorted_x)
+        start = 0
+        for expert, count in zip(self.routed_experts, counts):
+            end = start + count
+            if count > 0:
+                routed_out[start:end] = expert(sorted_x[start:end])
+            start = end
+
+        # Step 4: weight by routing scores, then scatter-add back.
+        # scatter_add_ accumulates contributions when a token is served by
+        # multiple experts (top_k > 1).
+        routed_out = routed_out * sorted_weights.unsqueeze(-1)
+        out = torch.zeros(N, C, device=x.device, dtype=x.dtype)
+        out.scatter_add_(0, sorted_tokens.unsqueeze(-1).expand(-1, C), routed_out)
+
         lb_loss = self._load_balance_loss(scores, topk_idx)
-        return shared_out + routed_out, lb_loss
+        return shared_out + out.view(B, T, C), lb_loss
 
     def _load_balance_loss(
         self, scores: torch.Tensor, topk_idx: torch.Tensor
