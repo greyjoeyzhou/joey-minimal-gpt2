@@ -193,56 +193,43 @@ class MoELayer(nn.Module):
         topk_scores, topk_idx = scores.topk(self.top_k, dim=-1)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)
 
-        # --- Sort-then-dispatch (replaces the old nested loop) ---
+        # --- Why the previous approaches were slow (7-day training) ---
         #
-        # Old approach: loop over (n_routed × top_k) = 8 iterations, each
-        # launching a small kernel on ~N/5 scattered tokens.
+        # Both the old nested loop and the sort-dispatch had the same root cause:
+        # *dynamic tensor shapes* that force torch.compile to recompile every step.
         #
-        # New approach:
-        #   1. Flatten all N*k (token, expert) assignment pairs.
-        #   2. Sort by expert ID → each expert's tokens become a contiguous slice.
-        #   3. One kernel per expert on its slice → n_routed=4 kernel launches.
-        #   4. Weight outputs and scatter-add back to original token positions.
+        #   flat_x[mask]         → size changes each step (different tokens selected)
+        #   sorted_x[start:end]  → size changes each step (different routing)
         #
-        # Why contiguous slices matter:
-        #   - One larger matmul per expert (better tensor-core utilisation).
-        #   - Sequential memory reads inside each chunk (coalesced access).
-        #   - Average chunk size ~N*k/n_routed ≈ 2× larger than before.
+        # torch.compile embeds tensor sizes as constants in compiled kernels.
+        # When a size changes, it discards the compiled kernel and recompiles
+        # (~0.5s per recompilation). With 4 experts × 12 layers × 16 micro-steps,
+        # that adds up to hundreds of recompilations per optimizer step — 7 days.
+        #
+        # --- Fix: fixed-shape dispatch ---
+        #
+        # Run every expert on the FULL batch (N, C) — shape never changes.
+        # Non-selected experts are zeroed out by multiplying by dispatch_w=0.
+        # torch.compile sees the same shapes every step → compiled once at step 0.
+        #
+        # Trade-off: (n_routed - top_k) extra expert forward passes per token.
+        # With n_routed=4, top_k=2: 2 extra passes → 2× routed expert compute.
+        # That is far cheaper than the recompilation overhead it eliminates.
 
-        # Step 1: flatten the N*k (token, expert) pairs.
-        token_ids  = torch.arange(N, device=x.device).unsqueeze(1).expand(N, self.top_k).reshape(-1)  # (N*k,)
-        expert_ids = topk_idx.reshape(-1)   # (N*k,)
-        weights    = topk_scores.reshape(-1)  # (N*k,)
+        # dispatch_w[n, e] = routing weight if expert e was selected for token n,
+        #                     0 otherwise. Shape (N, n_routed) — always the same.
+        dispatch_w = torch.zeros(N, self.n_routed, device=x.device, dtype=x.dtype)
+        dispatch_w.scatter_(1, topk_idx, topk_scores)
 
-        # Step 2: sort all pairs by expert ID.
-        sort_order     = expert_ids.argsort()
-        sorted_tokens  = token_ids[sort_order]   # (N*k,) — original token index
-        sorted_weights = weights[sort_order]     # (N*k,)
-        sorted_x       = flat_x[sorted_tokens]  # (N*k, C) — gathered inputs
-
-        # One CPU-GPU sync to get per-expert token counts as Python ints.
-        # This is unavoidable in pure PyTorch; a CUDA extension (e.g. Megablocks)
-        # eliminates it by keeping counts on-device.
-        counts = expert_ids[sort_order].bincount(minlength=self.n_routed).tolist()
-
-        # Step 3: one kernel per expert on its contiguous chunk.
-        routed_out = torch.empty_like(sorted_x)
-        start = 0
-        for expert, count in zip(self.routed_experts, counts):
-            end = start + count
-            if count > 0:
-                routed_out[start:end] = expert(sorted_x[start:end])
-            start = end
-
-        # Step 4: weight by routing scores, then scatter-add back.
-        # scatter_add_ accumulates contributions when a token is served by
-        # multiple experts (top_k > 1).
-        routed_out = routed_out * sorted_weights.unsqueeze(-1)
-        out = torch.zeros(N, C, device=x.device, dtype=x.dtype)
-        out.scatter_add_(0, sorted_tokens.unsqueeze(-1).expand(-1, C), routed_out)
+        # Each expert runs on the full batch; non-selected outputs are zero-weighted.
+        # The Python loop has n_routed=4 fixed iterations — torch.compile unrolls it.
+        routed_out = torch.zeros(N, C, device=x.device, dtype=x.dtype)
+        for e_id, expert in enumerate(self.routed_experts):
+            w = dispatch_w[:, e_id].unsqueeze(-1)   # (N, 1)
+            routed_out = routed_out + w * expert(flat_x)
 
         lb_loss = self._load_balance_loss(scores, topk_idx)
-        return shared_out + out.view(B, T, C), lb_loss
+        return shared_out + routed_out.view(B, T, C), lb_loss
 
     def _load_balance_loss(
         self, scores: torch.Tensor, topk_idx: torch.Tensor

@@ -1,102 +1,143 @@
 # minimal-gpt2
 
-A minimal, heavily commented training project for GPT-2 124M, for learning
-the mechanics of modern transformer pre-training. Follows Karpathy's
-`build-nanogpt` (the 2024 "Reproducing GPT-2" video).
+A minimal, heavily commented training project for learning the mechanics of
+modern transformer pre-training. Started as a re-creation of Karpathy's
+`build-nanogpt`, then evolved through four model versions — from vanilla GPT-2
+up to a miniature DeepSeek V2/V3-style architecture.
 
-## What's in here
+All versions train on **FineWeb-Edu `sample-10BT`** (~10B tokens) on a single
+RTX 5090. Dev/test runs on Mac.
 
-- **Model**: vanilla GPT-2 124M (12 layers, 12 heads, 768 dim, 1024 context).
-- **Data**: FineWeb-Edu `sample-10BT` (~10B tokens), tokenized to `uint16` shards.
-- **Training**: single-GPU loop, bf16 + `torch.compile`, cosine LR, AdamW, grad accum.
-- **Eval**: validation loss + zero-shot HellaSwag.
-- **Workflow**: dev/test on Mac, train on a Linux box with one RTX 5090.
+---
 
-Code is structured for *reading*. Every important choice has an inline
-comment explaining why. The `docs/` directory has block-by-block walkthroughs
-of the model, data pipeline, training recipe, hardware setup, and eval.
+## Model versions
+
+| | v0 (GPT-2) | v1 (modern) | v2 (nanowhale) | v3 (v1 + MoE) |
+|---|---|---|---|---|
+| **File** | `model.py` | `model_v1.py` | `model_v2.py` | `model_v3.py` |
+| **Params (total)** | ~124M | ~114M | ~106M | ~155M |
+| **Active/token** | ~124M | ~114M | ~60M | ~116M |
+| **Layers** | 12 | 12 | 8 | 12 |
+| **Norm** | LayerNorm | RMSNorm | RMSNorm | RMSNorm |
+| **Position** | Learned abs. | RoPE | RoPE + NoPE | RoPE |
+| **Attention** | MHA | GQA | MLA | GQA |
+| **FFN** | GELU dense | SwiGLU dense | SwiGLU MoE | SwiGLU MoE |
+| **Residual** | Standard | Standard | Hyper-Connections | Standard |
+| **Extra** | — | — | MTP aux head | load-balance loss |
+| **Context** | 1024 | 2048 | 2048 | 2048 |
+| **HellaSwag** | 30.6% | 30.2% | not trained | TBD |
+| **Trained to** | step 29,999 | step 19,072 | — | step 19,072 |
+
+**v2** is a miniature DeepSeek V2/V3-inspired model: MLA attention + DeepSeekMoE
+(shared + routed experts) + Multi-Token Prediction, with Hyper-Connections
+(from nanowhale) replacing standard residuals. It has not been trained yet.
+
+See `ARCHITECTURE_NOTES.md` for a detailed component-by-component breakdown
+and `MOE_DISPATCH_ITERATIONS.md` for the v3 MoE dispatch engineering story.
+
+---
+
+## Speed benchmarks (RTX 5090, torch.compile, micro_batch=16, seq_len=2048)
+
+| | v1 (modern) | v2 (nanowhale) | v3 (v1 + MoE) |
+|---|---|---|---|
+| **ms / step** | 172.4 ± 0.1 | 222.9 ± 0.5 | 238.2 ± 0.1 |
+| **tok / s** | 190,107 | 146,989 | 137,593 |
+| **vs v1** | baseline | 1.29× slower | 1.38× slower |
+
+v0 not benchmarked (different seq_len=1024; roughly comparable to v1).
+
+The MoE overhead (v2, v3) is real but bounded: both models use a fixed-shape
+dispatch that compiles once. The near-zero step variance confirms no per-step
+recompilation. See `MOE_DISPATCH_ITERATIONS.md` for the engineering story.
+Run `bench.py` to reproduce.
+
+---
 
 ## Repo layout
 
 ```
 .
+├── model.py / model_v1.py / model_v2.py / model_v3.py   # model definitions
+├── config.py / config_v1.py / config_v2.py / config_v3.py
+├── train.py / train_v1.py / train_v2.py / train_v3.py
+├── eval_hellaswag.py / eval_hellaswag_v1.py / ...
+├── sample.py / sample_v1.py / sample_v2.py / sample_v3.py
+├── data.py                      # shared sharded DataLoaderLite
+├── utils.py                     # LR schedule, device, CSV logger, seeding
+├── ARCHITECTURE_NOTES.md        # all-versions architecture reference
+├── MOE_DISPATCH_ITERATIONS.md   # v3 MoE dispatch: 3 implementations explained
 ├── docs/
 │   ├── 01-architecture.md
 │   ├── 02-data-pipeline.md
 │   ├── 03-training-recipe.md
 │   ├── 04-hardware-5090.md
 │   └── 05-eval-and-sampling.md
-├── model.py            # GPT-2 model
-├── config.py           # GPTConfig + TrainConfig
-├── data.py             # Sharded DataLoaderLite
-├── train.py            # Training loop
-├── sample.py           # Generate from a checkpoint
-├── eval_hellaswag.py   # Zero-shot HellaSwag
-├── utils.py            # LR schedule, device, CSV logger, seeding
 ├── scripts/
-│   ├── prep_shakespeare.py    # Mac smoke-test dataset
-│   └── prep_fineweb_edu.py    # Full 10B tokenization (run on 5090)
-├── tests/              # Unit tests + smoke train
-├── data/               # gitignored — token shards
-├── logs/               # gitignored — train.csv
-└── checkpoints/        # gitignored — model_*.pt
+│   ├── prep_shakespeare.py      # Mac smoke-test dataset
+│   └── prep_fineweb_edu.py      # Full 10B tokenization (run on 5090)
+├── tests/
+├── data/          # gitignored — token shards
+├── logs/          # gitignored — v0 train.csv
+├── logs_v1/       # gitignored — v1 train.csv
+├── logs_v3/       # gitignored — v3 train.csv
+├── checkpoints/   # gitignored — v0 model_*.pt
+├── checkpoints_v1/
+└── checkpoints_v3/
 ```
+
+---
 
 ## Quickstart
 
 ### On Mac (development)
 
 ```bash
-# Install (uv reads .python-version and pyproject.toml).
 uv sync --extra dev
-
-# Generate tiny smoke-test data.
-uv run python scripts/prep_shakespeare.py
-
-# Run all tests including the smoke train (~30s on M-series Mac).
-uv run pytest -v
+uv run python scripts/prep_shakespeare.py   # tiny smoke-test data
+uv run pytest -v                            # unit tests + smoke train (~30s)
 ```
 
-### On the 5090 workstation (real training)
+### On the 5090 (real training)
 
 ```bash
-# Same install on Linux (uv handles CUDA wheel selection for torch).
 uv sync --extra dev
 
-# 1) Tokenize FineWeb-Edu 10B (~few hours).
+# Tokenize FineWeb-Edu 10B (one-time, takes a few hours).
 uv run python scripts/prep_fineweb_edu.py
 
-# 2) Quick canary run — 50 steps. Watch nvidia-smi + tokens/sec.
-uv run python train.py --max_steps 50 --val_interval 100 --hella_interval 100 --save_interval 100
-
-# 3) Tune micro_batch_size + grad_accum_steps (see docs/04-hardware-5090.md).
-
-# 4) Full run.
+# Train — replace train.py with train_v1.py / train_v3.py for other versions.
 uv run python train.py
 
-# Resume if needed.
-uv run python train.py --resume checkpoints/model_005000.pt
+# Resume from a checkpoint.
+uv run python train.py --resume checkpoints/model_010000.pt
+
+# Evaluate on HellaSwag.
+uv run python eval_hellaswag.py --ckpt checkpoints/model_019072.pt
 
 # Sample from a checkpoint.
-uv run python sample.py --ckpt checkpoints/model_015000.pt --prompt "Hello, I'm a language model,"
+uv run python sample.py --ckpt checkpoints/model_019072.pt --prompt "Hello, I'm a language model,"
 ```
+
+---
 
 ## Reading order
 
-If you're new to the codebase:
+1. `docs/01-architecture.md` + `model.py` — start here (vanilla GPT-2).
+2. `model_v1.py` — adds RMSNorm, RoPE, GQA, SwiGLU.
+3. `model_v3.py` + `MOE_DISPATCH_ITERATIONS.md` — adds MoE on top of v1; dispatch engineering story.
+4. `model_v2.py` — full DeepSeek-style stack (MLA + MoE + Hyper-Connections + MTP).
+5. `ARCHITECTURE_NOTES.md` — all components explained side by side.
+6. `docs/02-data-pipeline.md`, `docs/03-training-recipe.md`, `docs/04-hardware-5090.md` — data, training, hardware.
 
-1. `docs/01-architecture.md` + `model.py` — the model.
-2. `docs/02-data-pipeline.md` + `data.py` + `scripts/prep_fineweb_edu.py` — the data.
-3. `docs/03-training-recipe.md` + `train.py` — the training loop.
-4. `docs/04-hardware-5090.md` — running it for real.
-5. `docs/05-eval-and-sampling.md` + `eval_hellaswag.py` + `sample.py` — looking at results.
+---
 
 ## Acknowledgements
 
-This project is a learning vehicle, not original work. It's a re-creation of
-Karpathy's [build-nanogpt](https://github.com/karpathy/build-nanogpt) with
-extra inline commentary aimed at someone learning transformer pre-training.
+Built on top of Karpathy's [build-nanogpt](https://github.com/karpathy/build-nanogpt).
+v2 architecture inspired by [nanowhale](https://huggingface.co/HuggingFaceTB/nanowhale-100m-base)
+and the DeepSeek V2/V3 papers.
 
 ## License
 
-For personal learning use. Not intended for distribution.
+Personal learning use. Not intended for distribution.

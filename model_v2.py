@@ -245,10 +245,10 @@ class MoELayer(nn.Module):
         when f_i is high (many tokens routing here), making P_i small
         reduces the loss, which pushes the router away from that expert.
 
-    Efficiency note:
-        The loop below processes each expert on its subset of tokens. For
-        production use, expert-parallel dispatch + gather kernels (e.g.
-        Megablocks) replace this loop with vectorized CUDA ops.
+    Dispatch:
+        Uses a fixed-shape weight matrix so all tensor shapes are constant
+        across steps and torch.compile compiles once. Every expert runs on the
+        full token batch; non-selected outputs are zeroed by dispatch_w=0.
     """
 
     def __init__(self, config: GPTConfig) -> None:
@@ -290,21 +290,22 @@ class MoELayer(nn.Module):
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)
 
         # --- Routed experts ---
-        # Flatten batch+seq into a single token dimension for dispatch.
-        flat_x      = x.view(B * T, C)
-        flat_idx    = topk_idx.view(B * T, self.top_k)
-        flat_scores = topk_scores.view(B * T, self.top_k)
+        # Fixed-shape dispatch: build a weight matrix (N, n_routed) where
+        # dispatch_w[n, e] = routing weight if token n selected expert e, else 0.
+        # Running every expert on the full flat_x keeps tensor shapes constant
+        # across steps, so torch.compile compiles once and reuses every step.
+        # Non-selected outputs are zeroed by the 0-weight in dispatch_w.
+        N = B * T
+        flat_x      = x.view(N, C)
+        flat_idx    = topk_idx.view(N, self.top_k)
+        flat_scores = topk_scores.view(N, self.top_k)
+        dispatch_w  = torch.zeros(N, self.n_routed, device=x.device, dtype=x.dtype)
+        dispatch_w.scatter_(1, flat_idx, flat_scores)          # no CPU-GPU sync
 
-        routed_out = torch.zeros(B * T, C, device=x.device, dtype=x.dtype)
+        routed_out = torch.zeros(N, C, device=x.device, dtype=x.dtype)
         for e_id, expert in enumerate(self.routed_experts):
-            # For each top-k slot, find tokens that chose this expert.
-            for k in range(self.top_k):
-                mask = (flat_idx[:, k] == e_id)   # (B*T,) boolean
-                if not mask.any():
-                    continue
-                w    = flat_scores[mask, k].unsqueeze(-1)  # (n_selected, 1)
-                out  = expert(flat_x[mask])                # (n_selected, C)
-                routed_out[mask] += w * out
+            w = dispatch_w[:, e_id].unsqueeze(-1)              # (N, 1) — fixed shape
+            routed_out = routed_out + w * expert(flat_x)       # (N, C) — fixed shape
 
         routed_out = routed_out.view(B, T, C)
 
